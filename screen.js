@@ -265,7 +265,9 @@ function _ndSyncMlGate(token, wantsMl, audio) {
 }
 
 const _ND_DIAGNOSTIC_FILENAME_MARKERS = [
-    'slopsmith-diagnostic-basic-guitar.sloppak',
+    // Brand-agnostic tail: matches the seeded sloppak whether it carries the
+    // old (slopsmith-) or current (feedBack-) name.
+    'diagnostic-basic-guitar.sloppak',
 ];
 
 function _ndFilenameLooksDiagnostic(fn) {
@@ -4385,7 +4387,7 @@ function createNoteDetector(options = {}) {
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                     const isHttp = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
                     const msg = isHttp
-                        ? 'Microphone access requires HTTPS. You are accessing Slopsmith over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
+                        ? 'Microphone access requires HTTPS. You are accessing feedBack over HTTP from a non-localhost address. Either:\n\n1. Use a reverse proxy with HTTPS (recommended)\n2. Access via localhost\n3. Add a self-signed certificate to the server'
                         : 'Microphone access is not available in this browser. Use Chrome or Edge.';
                     throw new Error(msg);
                 }
@@ -7540,12 +7542,20 @@ function createNoteDetector(options = {}) {
         return _calWizardIsTunerUiVisible();
     }
 
-    async function _calWizardOpenTunerFromWizard() {
+    // Open the tuner EMBEDDED in the wizard's tuner step: the tuner panel is
+    // moved into the step's .nd-cal-tuner-embed host and the wizard stays
+    // visible (tester feedback: the old flow hid the wizard behind the tuner,
+    // and after signal capture the wizard was gone with only the tuner left).
+    // Falls back to the legacy floating + minimize-wizard flow when the tuner
+    // plugin predates window.tuner.embedInto.
+    async function _calWizardEmbedTuner() {
         if (!window.tuner || typeof window.tuner.enable !== 'function') {
             _calWizardSetTunerOpenStatus(
                 'Tuner plugin is not loaded. Enable the Tuner plugin, then try again.', 'warn');
             return;
         }
+        const host = _calWizardEl && _calWizardEl.querySelector('.nd-cal-tuner-embed');
+        if (!host) return;
         _calWizardSetTunerOpenStatus('Opening tuner…', 'neutral');
         try {
             await window.tuner.enable();
@@ -7555,6 +7565,11 @@ function createNoteDetector(options = {}) {
                 'Tuner did not open. Check microphone permission or open the Tuner from the bottom toolbar.', 'warn');
             return;
         }
+        if (typeof window.tuner.embedInto === 'function' && window.tuner.embedInto(host)) {
+            _calWizardSetTunerOpenStatus('', 'neutral');
+            return;
+        }
+        // Downlevel tuner plugin (no embedInto): legacy floating flow.
         const visible = await _calWizardWaitForTunerUiVisible(4000);
         if (visible) {
             _calWizardSetTunerOpenStatus('', 'neutral');
@@ -8361,7 +8376,36 @@ function createNoteDetector(options = {}) {
         if (!partial) _calWizardMaybePauseAfterTimedPlayAlong(stashedPlayAlong);
     }
 
-    function _calWizardStartTimedPlayAlong(durationSec) {
+    // The timed play-along and "Minimize Wizard — Play Song" need a loaded
+    // song to score against. During onboarding no song is loaded (tester
+    // feedback: both buttons did nothing until a song was picked manually),
+    // so auto-load the builtin diagnostic sloppak when nothing is loaded.
+    // Never throws — a failure just leaves the wait to time out as before.
+    async function _calWizardEnsureSongForPlayback() {
+        try {
+            if (_calWizardIsPlaybackActive()) return true;
+            if (String(_ndShared.currentFilename || '').trim()) return true;
+            if (typeof window.playSong !== 'function') return false;
+            let diagFn = null;
+            try {
+                const res = await fetch('/api/progression');
+                if (res.ok) {
+                    const data = await res.json();
+                    diagFn = String((data && data.onboarding
+                        && data.onboarding.diagnostic_filename) || '').trim() || null;
+                }
+            } catch (_) { /* offline — leave diagFn null */ }
+            if (!diagFn) return false;
+            const p = window.playSong(diagFn, undefined, { bridge: false });
+            if (p && typeof p.then === 'function') await p;
+            return true;
+        } catch (e) {
+            console.warn('[note_detect] ensure song for playback:', e);
+            return false;
+        }
+    }
+
+    async function _calWizardStartTimedPlayAlong(durationSec) {
         const wiz = _calWizardState;
         if (!wiz) return;
         const snap = getCalibrationSnapshot();
@@ -8370,6 +8414,9 @@ function createNoteDetector(options = {}) {
             renderCalibrationWizard();
             return;
         }
+        // Auto-load the builtin diagnostic when no song is loaded, so the
+        // highway is actually reachable from the wait screen.
+        await _calWizardEnsureSongForPlayback();
         _calWizardStopTimedPlayAlong('restart');
         try { _resetCalibrationSamples(); } catch (e) {
             console.warn('[note_detect] resetCalibrationSamples:', e);
@@ -8429,6 +8476,17 @@ function createNoteDetector(options = {}) {
     function _calWizardCompletionHtml(wiz) {
         const applied = wiz.applied;
         const appliedParts = [];
+        // Optional next step offered after calibration: free curated amp
+        // tones from tone3000, downloaded and mapped to the user's songs by
+        // the Rig Builder plugin. Pure navigation — the Rig Builder screen
+        // owns the actual download/map flow. Hidden when the plugin screen
+        // is not mounted (plugin disabled / different build).
+        const tone3000Section = document.getElementById('plugin-rig_builder') ? `
+                <div class="mt-3 p-3 rounded-xl bg-dark-800/90 border border-cyan-900/40">
+                    <p class="text-sm font-semibold text-white mb-1">Want free amp tones for your songs?</p>
+                    <p class="text-xs text-gray-300 mb-2">Rig Builder can download curated amp tones from tone3000 and map them to your songs automatically.</p>
+                    <button type="button" class="nd-cal-tone3000 w-full py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-xs font-semibold text-white">Open Rig Builder — tone3000 tones</button>
+                </div>` : '';
         if (applied && applied.inputGain != null) {
             appliedParts.push(`Input gain ${_calWizardFmtGain(applied.inputGain)} — your hardest playing now peaks near −12 dBFS, so amps stay clean`);
         }
@@ -8446,7 +8504,8 @@ function createNoteDetector(options = {}) {
                     <p class="text-xs text-gray-400">${detailLine}</p>
                 </div>
                 <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
-                <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+                <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>
+                ${tone3000Section}`;
         }
         return `
             <div class="text-center py-3 mb-4 rounded-xl bg-dark-800/90 border border-gray-600">
@@ -8454,10 +8513,21 @@ function createNoteDetector(options = {}) {
                 <p class="text-sm text-gray-200">No recommended settings were applied.</p>
             </div>
             <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
-            <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+            <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>
+                ${tone3000Section}`;
     }
 
     function _calWizardReleaseTuner() {
+        // Unembed FIRST (while the panel is still in its host) so the tuner
+        // plugin restores its floating panel instead of leaving the embedded
+        // element to die with the wizard step's DOM.
+        try {
+            if (window.tuner && typeof window.tuner.unembed === 'function') {
+                window.tuner.unembed();
+            }
+        } catch (e) {
+            console.warn('[note_detect] cal wizard tuner unembed:', e);
+        }
         try {
             if (window.tuner && typeof window.tuner.disable === 'function') {
                 window.tuner.disable();
@@ -9157,7 +9227,7 @@ function createNoteDetector(options = {}) {
                     : '');
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Confirm which input channel Slopsmith is listening to. Strum while auto-detect runs.</p>
+                <p class="text-gray-300 text-xs mb-2">Confirm which input channel feedBack is listening to. Strum while auto-detect runs.</p>
                 <div class="text-[11px] text-gray-300 font-mono space-y-1 mb-2">
                     <div>Device: ${_calWizardDeviceLabel()}</div>
                     <div>Channel: ${snap.channel || '—'}</div>
@@ -9175,10 +9245,10 @@ function createNoteDetector(options = {}) {
                 <p class="text-[10px] text-amber-200/80">If stuck: check USB cable, interface gain, turn Detect on, and strum loudly during the test.</p>`;
         } else if (step === 2) {
             html = `
-                <p class="text-gray-300 text-xs mb-2">Tune your guitar using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
-                <p class="text-[10px] text-gray-500 mb-2">The tuner opens automatically and hides this wizard. Tap <strong>Return to Calibration Wizard</strong> when done — or use <strong>Open Tuner</strong> below to reopen it.</p>
-                <p class="text-[10px] text-amber-200/80">If notes miss often later: retune here before continuing.</p>
-                <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Open Tuner</button>
+                <p class="text-gray-300 text-xs mb-2">Tune your guitar with the <strong class="text-gray-200">tuner</strong> below — it lives inside this step.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">If notes miss often later: retune here before continuing.</p>
+                <div class="nd-cal-tuner-embed mb-2 min-h-[4rem] rounded-lg border border-dashed border-gray-600/60"></div>
+                <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Show Tuner</button>
                 <div class="nd-cal-tuner-open-status text-[11px] mb-2 min-h-[1.5rem]"></div>
                 <button type="button" class="nd-cal-tuned w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">I'm Tuned — Continue</button>`;
         } else if (step === 3) {
@@ -9273,7 +9343,7 @@ function createNoteDetector(options = {}) {
             const runBtnCls = allRunning ? ' opacity-60 cursor-not-allowed' : '';
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Quick check that Slopsmith hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
+                <p class="text-gray-300 text-xs mb-2">Quick check that feedBack hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
                 <p class="text-[10px] text-gray-500 mb-2">Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.</p>
                 <p class="text-[10px] text-gray-500 mb-2">Load a song first for song tuning in the tuner.</p>
                 ${instrumentPickerHtml}
@@ -9299,6 +9369,7 @@ function createNoteDetector(options = {}) {
             html = `
                 ${_calWizardDetectBanner(snap)}
                 <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song</strong> with Detect on so hits are scored. Tap <strong>Minimize Wizard — Play Song</strong> to reach the song highway (then <strong>Return to Calibration Wizard</strong> to come back), or <strong>Start Timed Play-Along Test</strong> for a clean ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s sample window.</p>
+                <p class="text-[10px] text-gray-500 mb-2">No song loaded? Both buttons load the built-in diagnostic track automatically.</p>
                 <p class="text-[10px] text-gray-500 mb-2">Use the speed you normally practice. This measures input vs chart alignment, not tempo.</p>
                 <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Your average timing vs chart: —</div>
                 <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) + ' average' : 'not enough hits yet'} · ${liveN} hit samples</p>
@@ -9328,11 +9399,23 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-finish-no-apply w-full py-2.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300">Finish Without Applying</button>`;
             }
         }
+        // The tuner panel may be embedded in this step's host (tuner step).
+        // The innerHTML swap below would orphan it — detect that and re-attach
+        // it to the fresh host right after the swap.
+        let _reembedTuner = false;
+        if (step === 2 && window.tuner && typeof window.tuner.embedInto === 'function') {
+            const _host = body.querySelector('.nd-cal-tuner-embed');
+            if (_host && _host.querySelector('#tuner-plugin-ui')) _reembedTuner = true;
+        }
         body.innerHTML = html;
+        if (_reembedTuner) {
+            const _newHost = body.querySelector('.nd-cal-tuner-embed');
+            if (_newHost) window.tuner.embedInto(_newHost);
+        }
 
         const openTuner = body.querySelector('.nd-cal-open-tuner');
         if (openTuner) {
-            openTuner.onclick = () => { _calWizardOpenTunerFromWizard(); };
+            openTuner.onclick = () => { _calWizardEmbedTuner(); };
         }
         const tunedBtn = body.querySelector('.nd-cal-tuned');
         if (tunedBtn) {
@@ -9435,8 +9518,11 @@ function createNoteDetector(options = {}) {
 
         const minimizePlay = body.querySelector('.nd-cal-minimize-play');
         if (minimizePlay) {
-            minimizePlay.onclick = () => {
+            minimizePlay.onclick = async () => {
                 _calWizardStopTimedPlayAlong('manual-minimize');
+                // Auto-load the builtin diagnostic when no song is loaded,
+                // so "Play Song" always lands somewhere playable.
+                await _calWizardEnsureSongForPlayback();
                 _calWizardMinimizeForPlayback();
             };
         }
@@ -9478,14 +9564,30 @@ function createNoteDetector(options = {}) {
             };
         }
 
+        const tone3000Btn = body.querySelector('.nd-cal-tone3000');
+        if (tone3000Btn) {
+            tone3000Btn.onclick = () => {
+                calibrationWizardClose();
+                // Navigate to the Rig Builder plugin screen — the tone3000
+                // download + map-to-songs flow lives there. Guard on the
+                // screen element like the plugins page does.
+                try {
+                    if (typeof window.showScreen === 'function'
+                        && document.getElementById('plugin-rig_builder')) {
+                        window.showScreen('plugin-rig_builder');
+                    }
+                } catch (e) {
+                    console.warn('[note_detect] navigate to rig_builder:', e);
+                }
+            };
+        }
+
         if (step >= 1 && step <= 6) _calWizardRefreshLive();
 
-        // One-shot, per-step-entry reveal of the surface that lives *behind*
-        // this modal (tester feedback: clicking the Tuner panel did nothing
-        // because the wizard overlay covers it). On entering the Tuner step,
-        // open the tuner (it minimizes the wizard). The guard is set BEFORE
-        // firing so the re-render this triggers can't recurse, and a step that
-        // didn't change (e.g. returning from the tuner) never re-fires.
+        // One-shot, per-step-entry auto-open of the Tuner step: the tuner is
+        // EMBEDDED into the step (the wizard stays visible). The guard is set
+        // BEFORE firing so the re-render this triggers can't recurse, and a
+        // step that didn't change never re-fires.
         //
         // The Timing step does NOT auto-minimize: a later tester reported the
         // step "does not load" because the card vanished the instant they
@@ -9496,7 +9598,7 @@ function createNoteDetector(options = {}) {
         wiz._autoEnterStep = step;
         if (enteredStep && !wiz.complete && !wiz.tunerMinimized) {
             if (step === 2) {
-                _calWizardOpenTunerFromWizard();
+                _calWizardEmbedTuner();
             }
         }
     }
@@ -9519,7 +9621,13 @@ function createNoteDetector(options = {}) {
         if (!_calWizardState || _calWizardState.step <= 0) return;
         _calWizardStopAllStringsRun('back');
         _calWizardStopAutoCapture();
-        if (_calWizardState.tunerMinimized) _calWizardSetTunerMinimized(false);
+        // Leaving the tuner step backwards too: release (unembed + disable)
+        // BEFORE the re-render destroys the step's embed host.
+        if (_calWizardState.step === 2) {
+            _calWizardReleaseTuner();
+        } else if (_calWizardState.tunerMinimized) {
+            _calWizardSetTunerMinimized(false);
+        }
         _calWizardState.step--;
         renderCalibrationWizard();
     }
@@ -10901,7 +11009,7 @@ function createNoteDetector(options = {}) {
         }
 
         if (stepId === 'intro') {
-            html += `<p class="text-gray-300 text-xs mb-3"><strong class="text-gray-200">Calibration Wizard</strong> sets up your input. <strong class="text-gray-200">Technique Assessment</strong> checks how well Slopsmith hears your playing.</p>
+            html += `<p class="text-gray-300 text-xs mb-3"><strong class="text-gray-200">Calibration Wizard</strong> sets up your input. <strong class="text-gray-200">Technique Assessment</strong> checks how well feedBack hears your playing.</p>
                 <p class="text-gray-300 text-xs mb-3">Each check looks at <strong class="text-gray-200">signal clarity</strong>, whether the <strong class="text-gray-200">main note</strong> is present, and <strong class="text-gray-200">tuning match</strong>. Read-only — nothing here changes gameplay settings.</p>
                 <button type="button" class="nd-cal-lab-start-basic w-full py-2.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2">Start Basic Assessment</button>
                 <p class="text-[10px] text-gray-500 mb-3">Checks input level, open strings, one fretted note, and one power chord. Best first step.</p>
@@ -16068,7 +16176,7 @@ function createNoteDetector(options = {}) {
                 if (!localBundle || !doRetry) return;
                 retryBtn.disabled = true;
                 retryBtn.textContent = 'Retrying…';
-                setStatus('info', 'Re-uploading the saved bundle to pCloud — no re-recording needed. Don’t close Slopsmith yet.');
+                setStatus('info', 'Re-uploading the saved bundle to pCloud — no re-recording needed. Don’t close feedBack yet.');
                 let result = null;
                 const p = doRetry(localBundle);
                 _activeUpload = p;
@@ -16104,7 +16212,7 @@ function createNoteDetector(options = {}) {
                 submitBtn.disabled = true;
                 submitBtn.textContent = 'Uploading…';
                 cancelBtn.textContent = 'Hide';
-                setStatus('info', 'Bundling the WAV, detect-stream, and manifest, then shipping to pCloud. Don’t close Slopsmith yet — this can take a few seconds on a slow uplink.');
+                setStatus('info', 'Bundling the WAV, detect-stream, and manifest, then shipping to pCloud. Don’t close feedBack yet — this can take a few seconds on a slow uplink.');
 
                 let result = null;
                 const p = doUpload(formData);
@@ -16777,11 +16885,13 @@ function createNoteDetector(options = {}) {
     const _DIAGNOSTIC_TRACK_CATALOG = [
         {
             id: 'basic-guitar-6',
-            title: 'Slopsmith Diagnostic — Basic Guitar',
-            artist: 'Slopsmith',
+            title: 'FeedBack Diagnostic — Basic Guitar',
+            artist: 'FeedBack',
             arrangement: 'Diagnostic Guitar',
-            filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
-            dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
+            // Brand-agnostic tail: matches the file whether it was seeded
+            // under the old (slopsmith-) or current (feedBack-) name.
+            filenameIncludes: 'diagnostic-basic-guitar.sloppak',
+            dlcRelativePath: 'diagnostics-builtin/feedBack-diagnostic-basic-guitar.sloppak',
             instrument: 'guitar',
             stringCount: 6,
             reportProfile: 'basic-guitar-v1',
@@ -16919,7 +17029,7 @@ function createNoteDetector(options = {}) {
         if (typeof window.playSong !== 'function') {
             _ndSetDiagnosticLaunchStatus(
                 panel,
-                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+                'Diagnostic track could not be loaded. Restart feedBack or rescan your library.',
             );
             return;
         }
@@ -16943,7 +17053,7 @@ function createNoteDetector(options = {}) {
             console.warn('[note_detect] diagnostic launch failed:', e);
             _ndSetDiagnosticLaunchStatus(
                 panel,
-                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+                'Diagnostic track could not be loaded. Restart feedBack or rescan your library.',
             );
             return;
         }
@@ -16959,7 +17069,7 @@ function createNoteDetector(options = {}) {
 
         _ndSetDiagnosticLaunchStatus(
             panel,
-            'Diagnostic track is not available yet. Restart Slopsmith or rescan the library. If it still does not appear, the built-in diagnostic pack may not be installed.',
+            'Diagnostic track is not available yet. Restart feedBack or rescan the library. If it still does not appear, the built-in diagnostic pack may not be installed.',
         );
     }
 
