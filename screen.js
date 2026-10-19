@@ -8376,15 +8376,76 @@ function createNoteDetector(options = {}) {
         if (!partial) _calWizardMaybePauseAfterTimedPlayAlong(stashedPlayAlong);
     }
 
+    // The diagnostic song needs a RUNNING, AUDIBLE engine — the same
+    // guarantee the onboarding "Play it now" step makes before playSong().
+    // Without it a cold-start load (engine never started, or direct
+    // monitoring muted) lands in silence. Desktop only; best-effort.
+    async function _calWizardEnsureEngineAudible() {
+        try {
+            const audio = window.feedBackDesktop && window.feedBackDesktop.audio;
+            if (!audio) return;
+            const running = typeof audio.isAudioRunning === 'function'
+                ? await audio.isAudioRunning() : false;
+            if (!running && typeof audio.startAudio === 'function') await audio.startAudio();
+            if (typeof audio.loadDeviceSettings === 'function') {
+                const saved = await audio.loadDeviceSettings();
+                if (saved) {
+                    if (typeof saved.monitorMute === 'boolean' && typeof audio.setMonitorMute === 'function') {
+                        await audio.setMonitorMute(saved.monitorMute);
+                    }
+                    if (typeof saved.monitorKill === 'boolean' && typeof audio.setMonitorKill === 'function') {
+                        await audio.setMonitorKill(saved.monitorKill);
+                    }
+                } else if (typeof audio.setMonitorMute === 'function') {
+                    // Fresh profile: the native engine boots with direct
+                    // monitoring muted — unmute so the play-along is audible.
+                    await audio.setMonitorMute(false);
+                }
+            }
+        } catch (e) { /* best-effort */ }
+        try {
+            if (typeof window._aeEnsureAmpSimsMonitoring === 'function') {
+                await window._aeEnsureAmpSimsMonitoring();
+            }
+        } catch (e) { /* best-effort */ }
+    }
+
+    // True while the highway holds a loaded song. getSongInfo() is {} until
+    // the first song_info frame arrives and again after highway.stop(), so a
+    // non-empty object means loaded; the player screen being up also counts
+    // (a load may still be in flight before its song_info frame). A
+    // loaded-but-paused song is kept as-is — the user just presses Play once
+    // the wizard minimizes.
+    function _calWizardSongLoaded() {
+        try {
+            const hwNow = resolveHw();
+            const si = (hwNow && typeof hwNow.getSongInfo === 'function')
+                ? hwNow.getSongInfo() : null;
+            if (si && typeof si === 'object' && Object.keys(si).length > 0) return true;
+        } catch (_) { /* fall through to the screen check */ }
+        try {
+            const active = document.querySelector('.screen.active');
+            if (active && active.id === 'player') return true;
+        } catch (_) { /* ignore */ }
+        return false;
+    }
+
     // The timed play-along and "Minimize Wizard — Play Song" need a loaded
     // song to score against. During onboarding no song is loaded (tester
     // feedback: both buttons did nothing until a song was picked manually),
     // so auto-load the builtin diagnostic sloppak when nothing is loaded.
-    // Never throws — a failure just leaves the wait to time out as before.
+    // Never throws — returns false when no playable song could be ensured.
     async function _calWizardEnsureSongForPlayback() {
         try {
             if (_calWizardIsPlaybackActive()) return true;
-            if (String(_ndShared.currentFilename || '').trim()) return true;
+            await _calWizardEnsureEngineAudible();
+            // NOTE: _ndShared.currentFilename is NOT a loaded-song signal — it
+            // is the last filename handed to playSong() and is never cleared,
+            // so after any earlier song (e.g. the onboarding diagnostic) it
+            // stays set. Keying the skip on it made both buttons minimize with
+            // nothing loaded: no diagnostic, no playback, and the wait ended
+            // in "cancelled — returned before playback started".
+            if (_calWizardSongLoaded()) return true;
             if (typeof window.playSong !== 'function') return false;
             let diagFn = null;
             try {
@@ -8415,8 +8476,15 @@ function createNoteDetector(options = {}) {
             return;
         }
         // Auto-load the builtin diagnostic when no song is loaded, so the
-        // highway is actually reachable from the wait screen.
-        await _calWizardEnsureSongForPlayback();
+        // highway is actually reachable from the wait screen. When nothing
+        // playable could be ensured, stay in the wizard with an actionable
+        // note instead of minimizing into a wait that can only cancel.
+        const ensured = await _calWizardEnsureSongForPlayback();
+        if (!ensured) {
+            wiz.timingCaptureNote = 'Could not load the built-in diagnostic track — start any song, then retry.';
+            renderCalibrationWizard();
+            return;
+        }
         _calWizardStopTimedPlayAlong('restart');
         try { _resetCalibrationSamples(); } catch (e) {
             console.warn('[note_detect] resetCalibrationSamples:', e);
@@ -9521,8 +9589,14 @@ function createNoteDetector(options = {}) {
             minimizePlay.onclick = async () => {
                 _calWizardStopTimedPlayAlong('manual-minimize');
                 // Auto-load the builtin diagnostic when no song is loaded,
-                // so "Play Song" always lands somewhere playable.
-                await _calWizardEnsureSongForPlayback();
+                // so "Play Song" always lands somewhere playable. When nothing
+                // playable could be ensured, stay put with an actionable note.
+                const ensured = await _calWizardEnsureSongForPlayback();
+                if (!ensured) {
+                    wiz.timingCaptureNote = 'Could not load the built-in diagnostic track — start any song, then retry.';
+                    renderCalibrationWizard();
+                    return;
+                }
                 _calWizardMinimizeForPlayback();
             };
         }
