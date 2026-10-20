@@ -30,11 +30,13 @@ function wizardSteps() {
     return eval(m[1]);
 }
 
-test('wizard has 10 steps and no tuner step', () => {
+test('wizard has 9 steps and no tuner or gameplay step', () => {
     const steps = wizardSteps();
     assert.deepEqual(steps.map((s) => s.id),
-        ['welcome', 'audio', 'noise', 'signal', 'gameplay', 'notes', 'timing', 'review', 'ready', 'apply']);
+        ['welcome', 'audio', 'noise', 'signal', 'notes', 'timing', 'review', 'ready', 'apply']);
     assert.ok(!steps.some((s) => s.id === 'tuner'), 'tuner step must be gone');
+    assert.ok(!steps.some((s) => s.id === 'gameplay'), 'gameplay settings moved to the onboarding overlay');
+    assert.ok(!SRC.includes("id: 'gameplay'"), 'no gameplay step id anywhere in the step list');
     assert.ok(!SRC.includes("id: 'tuner'"), 'no tuner step id anywhere in the step list');
 });
 
@@ -42,14 +44,12 @@ test('wizard steps declare the plugins they need', () => {
     const steps = wizardSteps();
     const byId = {};
     steps.forEach((s) => { byId[s.id] = s.requires || []; });
-    // Plugin-free steps first: welcome/audio/noise/signal need nothing, and the
-    // gameplay step (Settings → Gameplay) runs before the plugin-dependent
-    // steps so it also buys the background plugin loader some time.
+    // Plugin-free steps need nothing; the measurement steps (noise/signal)
+    // run before the plugin-dependent steps.
     assert.deepEqual(byId.welcome, []);
     assert.deepEqual(byId.audio, []);
     assert.deepEqual(byId.noise, []);
     assert.deepEqual(byId.signal, []);
-    assert.deepEqual(byId.gameplay, []);
     assert.deepEqual(byId.review, []);
     // Detection steps need the note detector itself.
     assert.deepEqual(byId.notes, ['note_detect']);
@@ -64,7 +64,6 @@ test('plugin-free steps come before plugin-dependent steps; the gate sits before
     const idx = (id) => steps.findIndex((s) => s.id === id);
     const firstPluginStep = steps.findIndex((s) => (s.requires || []).length > 0);
     assert.equal(firstPluginStep, idx('notes'), 'notes is the first plugin-dependent step');
-    assert.ok(idx('gameplay') < idx('notes'), 'gameplay runs before the plugin-dependent steps');
     assert.ok(idx('ready') > idx('review'), 'the challenge gate sits after review');
     assert.ok(idx('apply') > idx('ready'), 'apply (final check) is the last step');
 });
@@ -165,7 +164,7 @@ const TWO_STRINGS = [
 
 function makeHarness(specs) {
     const statuses = [];
-    const wiz = { step: 5, notes: {}, stringAutoDetect: null };
+    const wiz = { step: 4, notes: {}, stringAutoDetect: null };
     const fn = buildAutoDetect();
     const autoDetect = fn(
         wiz,
@@ -182,7 +181,7 @@ const snapHearing = (rawMidi) => ({ enabled: true, rawMidi, heardConfidencePct: 
 
 test('auto-detect ignores ticks when the wizard is not on the notes step', () => {
     const { wiz, autoDetect, statuses } = makeHarness(TWO_STRINGS);
-    wiz.step = 4; // gameplay step — not the notes step
+    wiz.step = 3; // signal step — not the notes step
     autoDetect(snapHearing(40));
     assert.equal(statuses.length, 0, 'no status writes off the notes step');
     assert.deepEqual(wiz.notes, {});
@@ -277,25 +276,25 @@ const GATE_ROWS = [
 
 test('plugin gate: ready+enabled plugins pass, anything else is missing', () => {
     const build = buildPluginGate();
-    const api = build({ step: 5, pluginStatus: { rows: [
+    const api = build({ step: 4, pluginStatus: { rows: [
         { id: 'note_detect', status: 'ready', enabled: true },
         { id: 'rig_builder', status: 'installing', enabled: true },
     ] } });
-    assert.deepEqual(api._calWizardStepMissingPlugins(5), [], 'note_detect ready → notes step unblocked');
-    assert.deepEqual(api._calWizardStepMissingPlugins(8), ['rig_builder'], 'rig_builder installing → challenge gate blocked');
-    const api2 = build({ step: 8, pluginStatus: { rows: [
+    assert.deepEqual(api._calWizardStepMissingPlugins(4), [], 'note_detect ready → notes step unblocked');
+    assert.deepEqual(api._calWizardStepMissingPlugins(7), ['rig_builder'], 'rig_builder installing → challenge gate blocked');
+    const api2 = build({ step: 7, pluginStatus: { rows: [
         { id: 'note_detect', status: 'ready', enabled: false },
         { id: 'rig_builder', status: 'ready', enabled: true },
     ] } });
-    assert.deepEqual(api2._calWizardStepMissingPlugins(8), ['note_detect'], 'a disabled plugin counts as not ready');
-    const api3 = build({ step: 8, pluginStatus: { rows: null } });
-    assert.deepEqual(api3._calWizardStepMissingPlugins(8), ['note_detect', 'rig_builder'],
+    assert.deepEqual(api2._calWizardStepMissingPlugins(7), ['note_detect'], 'a disabled plugin counts as not ready');
+    const api3 = build({ step: 7, pluginStatus: { rows: null } });
+    assert.deepEqual(api3._calWizardStepMissingPlugins(7), ['note_detect', 'rig_builder'],
         'no /api/plugins snapshot yet → everything required is missing');
 });
 
 test('challenge gate also requires the note detector playSong wrapper', () => {
     const build = buildPluginGate();
-    const state = { step: 8, pluginStatus: { rows: GATE_ROWS } };
+    const state = { step: 7, pluginStatus: { rows: GATE_ROWS } };
     const noWrapper = build(state, {});
     const c1 = noWrapper._calWizardChallengeReady();
     assert.equal(c1.ndFunctional, false, 'no playSong wrapper → HUD not armed');
@@ -330,7 +329,7 @@ test('the manual per-string check UI is fully removed', () => {
 });
 
 test('the notes step renders one live row per string and auto-detects on tick', () => {
-    assert.ok(SRC.includes('} else if (step === 5) {'), 'notes step renders at step 5');
+    assert.ok(SRC.includes('} else if (step === 4) {'), 'notes step renders at step 4');
     assert.ok(SRC.includes('const noteSpecs = _calWizardResolveNoteChecks();'));
     assert.ok(SRC.includes('data-note-result='), 'per-string live result rows');
     assert.ok(SRC.includes('_calWizardAutoDetectStrings(snap);'), 'refresh tick drives auto-detection');
@@ -352,26 +351,13 @@ test('Next is blocked while a required plugin is not ready', () => {
 });
 
 test('the apply step gates Apply/Finish on challenge readiness', () => {
-    assert.ok(SRC.includes("step === 9 && challenge && !challenge.ready"), 'final check on the apply step');
+    assert.ok(SRC.includes("step === 8 && challenge && !challenge.ready"), 'final check on the apply step');
     assert.ok(SRC.includes("body.querySelector('.nd-cal-apply-safe')"), 'Apply waits for readiness');
     assert.ok(SRC.includes("body.querySelector('.nd-cal-finish-no-apply')"), 'Finish waits for readiness');
 });
 
-test('the gameplay step renders the Settings → Gameplay controls', () => {
-    for (const cls of ['nd-cal-gp-lefty', 'nd-cal-gp-mastery', 'nd-cal-gp-avoffset', 'nd-cal-gp-countdown',
-        'nd-cal-gp-upnext', 'nd-cal-gp-autoplay', 'nd-cal-gp-confirmexit', 'nd-cal-gp-arrangement',
-        'nd-cal-gp-misspenalty', 'nd-cal-gp-failbehavior']) {
-        assert.ok(SRC.includes(cls), 'gameplay control wired: ' + cls);
-    }
-    assert.ok(SRC.includes("window.persistSetting('default_arrangement'"), 'arrangement persists like Settings');
-    assert.ok(SRC.includes("window.persistSetting('miss_penalty'"), 'miss penalty persists like Settings');
-    assert.ok(SRC.includes("window.persistSetting('fail_behavior'"), 'fail behavior persists like Settings');
-    assert.ok(SRC.includes("window.setMastery(el.value)"), 'highway speed goes through the Settings setter');
-    assert.ok(SRC.includes("window.setAvOffsetMs(el.value)"), 'A/V offset goes through the Settings setter');
-});
-
 test('the ready step gates the challenge and offers a bounded override', () => {
-    assert.ok(SRC.includes('} else if (step === 8) {'), 'ready step renders at step 8');
+    assert.ok(SRC.includes('} else if (step === 7) {'), 'ready step renders at step 7');
     assert.ok(SRC.includes('nd-cal-ready-override'), 'override button after a bounded wait');
     assert.ok(SRC.includes('pluginWaitOverride = true'), 'override lifts the gate');
     assert.ok(SRC.includes('_calWizardChallengeReady()'), 'final challenge check runs');

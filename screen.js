@@ -2910,10 +2910,6 @@ function createNoteDetector(options = {}) {
         { id: 'audio', title: 'Audio Input', requires: [] },
         { id: 'noise', title: 'Noise Floor', requires: [] },
         { id: 'signal', title: 'Signal Level', requires: [] },
-        // Gameplay preferences (mirrors Settings → Gameplay). Needs no plugin,
-        // so it runs before the plugin-dependent steps and gives the
-        // background plugin loader time to finish.
-        { id: 'gameplay', title: 'Gameplay Settings', requires: [] },
         { id: 'notes', title: 'Note Detection', requires: ['note_detect'] },
         { id: 'timing', title: 'Timing / Latency', requires: ['note_detect'] },
         { id: 'review', title: 'Review', requires: [] },
@@ -7417,8 +7413,6 @@ function createNoteDetector(options = {}) {
             // rows from /api/plugins + the global loaded/total counter from
             // /api/startup-status. Polled by _calWizardPluginTick while open.
             pluginStatus: { rows: null, loaded: 0, total: 0, fetchedAt: 0 },
-            // Gameplay-settings snapshot (/api/settings) for the gameplay step.
-            gameplaySettings: null,
             // Set by the "Continue anyway" button on the ready step after a
             // bounded wait — lets a stuck user through the plugin gate.
             pluginWaitOverride: false,
@@ -7856,7 +7850,7 @@ function createNoteDetector(options = {}) {
     const _CAL_WIZARD_STRING_AUTO_TICKS = 3;
     function _calWizardAutoDetectStrings(snap) {
         const wiz = _calWizardState;
-        if (!wiz || wiz.step !== 5) return;
+        if (!wiz || wiz.step !== 4) return;
         const specs = _calWizardResolveNoteChecks();
         if (!specs.length) return;
         if (!snap || !snap.enabled) {
@@ -8919,7 +8913,7 @@ function createNoteDetector(options = {}) {
     // Poll cadence for plugin readiness while the wizard is open. Re-renders
     // only when the current step's missing-plugin set (or the challenge-ready
     // flag) changes AND the step actually needs a plugin — so an in-progress
-    // Gameplay-Settings edit is never clobbered by a poll.
+    // edit on a plugin-free step is never clobbered by a poll.
     const _CAL_WIZARD_PLUGIN_POLL_MS = 500;
     let _calWizardPluginTick = null;
     function _calWizardPluginTickStart() {
@@ -8939,7 +8933,7 @@ function createNoteDetector(options = {}) {
                 wiz._lastChallengeReady = challenge.ready;
                 const meta = _CAL_WIZARD_STEPS[wiz.step] || {};
                 const relevant = (meta.requires && meta.requires.length)
-                    || wiz.step === 8 || wiz.step === 9;
+                    || wiz.step === 7 || wiz.step === 8;
                 if (relevant && (key !== prevMissing || challenge.ready !== prevChallenge)) {
                     renderCalibrationWizard();
                 }
@@ -8958,7 +8952,7 @@ function createNoteDetector(options = {}) {
         if (live) live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
         const heard = _calWizardEl.querySelector('.nd-cal-heard');
         if (heard) {
-            if (wiz.step === 5) {
+            if (wiz.step === 4) {
                 heard.textContent = snap.heardConfidencePct != null
                     ? `Now hearing: ${snap.rawHeardNote ?? snap.heardNote} · ${snap.heardConfidencePct}% confidence`
                     : `Now hearing: nothing yet — play a note · Channel: ${snap.channel || '—'} · Live: `
@@ -8971,7 +8965,7 @@ function createNoteDetector(options = {}) {
         }
         const debugEl = _calWizardEl.querySelector('.nd-cal-pitch-debug');
         if (debugEl) {
-            if (wiz.step === 5) {
+            if (wiz.step === 4) {
                 // Show the next string still waiting for its OK — that is what
                 // the player should play (tuner-style auto-detection).
                 const specs = _calWizardResolveNoteChecks();
@@ -9006,7 +9000,7 @@ function createNoteDetector(options = {}) {
                 debugEl.classList.add('hidden');
             }
         }
-        if (wiz.step === 5) {
+        if (wiz.step === 4) {
             // Tuner-style auto-detect first, so a string verified this tick
             // repaints OK immediately; then refresh every row from wiz.notes.
             _calWizardAutoDetectStrings(snap);
@@ -9111,16 +9105,16 @@ function createNoteDetector(options = {}) {
         const wiz = _calWizardState;
         const meta = _CAL_WIZARD_STEPS[step] || { title: 'Step' };
         title.textContent = `Calibration Wizard — ${meta.title}`;
-        if (backBtn) backBtn.style.visibility = step > 0 && step < 9 ? 'visible' : 'hidden';
+        if (backBtn) backBtn.style.visibility = step > 0 && step < 8 ? 'visible' : 'hidden';
         if (nextBtn) {
-            if (step >= 9) {
+            if (step >= 8) {
                 nextBtn.style.display = 'none';
             } else {
                 nextBtn.style.display = '';
-                nextBtn.textContent = step === 8 ? 'Continue to Apply' : 'Next';
+                nextBtn.textContent = step === 7 ? 'Continue to Apply' : 'Next';
             }
         }
-        if (step === 7) _calWizardBuildSafeRecommendations(wiz, snap);
+        if (step === 6) _calWizardBuildSafeRecommendations(wiz, snap);
 
         let html = '';
         if (step === 0) {
@@ -9186,75 +9180,6 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
                 <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
         } else if (step === 4) {
-            // Gameplay settings (mirrors Settings → Gameplay). No plugin needed:
-            // this step also gives the background plugin loader time to finish
-            // before the steps that DO need one.
-            const gs = wiz.gameplaySettings || {};
-            const lsGet = (k, dflt) => {
-                try { const v = localStorage.getItem(k); return v == null ? dflt : v; }
-                catch (_) { return dflt; }
-            };
-            if (!wiz.gameplaySettings) {
-                // One-shot load of the persisted gameplay values; re-render once
-                // they land so the controls show the saved state.
-                fetch('/api/settings').then((r) => (r.ok ? r.json() : null)).then((s) => {
-                    if (_calWizardState && s && _calWizardState.step === 4) {
-                        _calWizardState.gameplaySettings = s;
-                        renderCalibrationWizard();
-                    }
-                }).catch(() => {});
-            }
-            const leftyOn = !!(window.highway && typeof window.highway.getLefty === 'function'
-                ? window.highway.getLefty()
-                : lsGet('lefty', '0') === '1');
-            const masteryPct = Number.isFinite(Number(gs.master_difficulty))
-                ? Math.max(0, Math.min(100, Math.round(Number(gs.master_difficulty)))) : 100;
-            const avMs = Number.isFinite(Number(gs.av_offset_ms))
-                ? Math.max(-1000, Math.min(1000, Math.round(Number(gs.av_offset_ms)))) : 0;
-            const gpToggle = (cls, title, desc, checked, avail) => `
-                <div class="flex items-center gap-2 py-1.5 border-b border-gray-700/50">
-                    <div class="flex-1 min-w-0">
-                        <div class="text-gray-200 text-xs">${title}</div>
-                        <div class="text-gray-500 text-[10px]">${desc}</div>
-                    </div>
-                    <label class="fb-switch shrink-0${avail ? '' : ' opacity-40'}">
-                        <input type="checkbox" class="nd-cal-gp-${cls}"${checked ? ' checked' : ''}${avail ? '' : ' disabled'}>
-                        <span class="fb-switch-track"></span>
-                    </label>
-                </div>`;
-            const gpSlider = (cls, title, desc, value, min, max, step, suffix, avail) => `
-                <div class="py-1.5 border-b border-gray-700/50">
-                    <div class="flex justify-between items-center">
-                        <div class="text-gray-200 text-xs">${title}</div>
-                        <span class="nd-cal-gp-${cls}-val text-cyan-300/90 text-[11px] font-mono">${value}${suffix}</span>
-                    </div>
-                    <div class="text-gray-500 text-[10px] mb-1">${desc}</div>
-                    <input type="range" class="nd-cal-gp-${cls} w-full${avail ? '' : ' opacity-40'}" min="${min}" max="${max}" step="${step}" value="${value}"${avail ? '' : ' disabled'}>
-                </div>`;
-            const gpSelect = (cls, title, desc, value, values, labels, avail) => `
-                <div class="flex items-center gap-2 py-1.5 border-b border-gray-700/50">
-                    <div class="flex-1 min-w-0">
-                        <div class="text-gray-200 text-xs">${title}</div>
-                        <div class="text-gray-500 text-[10px]">${desc}</div>
-                    </div>
-                    <select class="nd-cal-gp-${cls} bg-dark-600 border border-gray-600 rounded px-2 py-1 text-xs text-gray-200 shrink-0${avail ? '' : ' opacity-40'}"${avail ? '' : ' disabled'}>
-                        ${values.map((v, i) => `<option value="${v}"${v === value ? ' selected' : ''}>${labels[i]}</option>`).join('')}
-                    </select>
-                </div>`;
-            html = `
-                <p class="text-gray-300 text-xs mb-2">Quick gameplay preferences — the same settings as <strong class="text-gray-200">Settings → Gameplay</strong>. This step needs no plugin, and gives the app a moment to finish loading background plugins.</p>
-                ${gpToggle('lefty', 'Left-handed mode', 'Invert the note highway.', leftyOn, !!(window.highway && typeof window.highway.setLefty === 'function'))}
-                ${gpSlider('mastery', 'Note highway speed', 'Master difficulty — 100% plays the full arrangement.', masteryPct, 0, 100, 5, '%', typeof window.setMastery === 'function')}
-                ${gpSlider('avoffset', 'A/V sync offset', 'Positive = audio ahead of visuals.', avMs, -1000, 1000, 1, ' ms', typeof window.setAvOffsetMs === 'function')}
-                ${gpToggle('countdown', 'Countdown before song', 'Four-beat count-in before a song starts.', lsGet('countdownBeforeSong', '0') === '1', typeof window.setCountdownBeforeSong === 'function')}
-                ${gpToggle('upnext', 'Show "Up Next"', 'Upcoming-section pill in the player.', lsGet('showUpNext', '1') !== '0', typeof window.setShowUpNext === 'function')}
-                ${gpToggle('autoplay', 'Autoplay & auto-exit', 'Return to the menu when the score screen closes.', lsGet('autoplayExit', '0') === '1', typeof window.setAutoplayExit === 'function')}
-                ${gpToggle('confirmexit', 'Ask before leaving a song', 'Confirm before exiting a song.', lsGet('confirmExitSong', '0') === '1', typeof window.setConfirmExitSong === 'function')}
-                ${gpSelect('arrangement', 'Default arrangement', 'Which arrangement loads first.', gs.default_arrangement || '', ['', 'Lead', 'Rhythm', 'Bass'], ['Most notes (auto)', 'Lead', 'Rhythm', 'Bass'], typeof window.persistSetting === 'function')}
-                ${gpSelect('misspenalty', 'Miss penalty', 'How harshly misses are scored.', gs.miss_penalty || 'none', ['none', 'low', 'medium', 'high'], ['None', 'Low', 'Standard', 'High'], typeof window.persistSetting === 'function')}
-                ${gpSelect('failbehavior', 'Fail behavior', 'What happens when you fail a section.', gs.fail_behavior || 'continue', ['continue', 'restart', 'stop'], ['Continue playing', 'Restart section', 'Stop song'], typeof window.persistSetting === 'function')}
-                <p class="text-[10px] text-gray-500 mt-2">Changes save automatically, exactly like in Settings.</p>`;
-        } else if (step === 5) {
             const noteSpecs = _calWizardResolveNoteChecks();
             // Standalone (no song): let the player pick their instrument so the
             // open-string targets cover 5/6-string bass and 7/8-string guitar.
@@ -9290,7 +9215,7 @@ function createNoteDetector(options = {}) {
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 h-[2.75rem] overflow-y-auto">—</div>
                 <div class="mb-2">${noteRows}</div>
                 <p class="text-[10px] text-gray-500">If a string never turns OK: retune it, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
-        } else if (step === 6) {
+        } else if (step === 5) {
             const t = wiz.timing;
             const liveMed = snap.timingMedianMs;
             const liveN = (snap.diagnostic && snap.diagnostic.timing_error_ms_hits)
@@ -9311,13 +9236,13 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
                 <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
                 ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
-        } else if (step === 7) {
+        } else if (step === 6) {
             html = `
                 <p class="text-sm text-gray-200 mb-3">Review safe recommendations. Uncheck anything you do not want applied.</p>
                 ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: true })}
                 ${_calWizardReviewDetailsHtml(wiz)}
                 <p class="text-xs text-gray-500 mt-2"><strong class="text-gray-400">Never changed by this wizard:</strong> pitch tolerance, timing tolerance, chord leniency, clean timing/pitch thresholds, harmonic SNR, note verifier / scoring thresholds</p>`;
-        } else if (step === 8) {
+        } else if (step === 7) {
             // Challenge-readiness gate: the diagnostic challenge that follows
             // the wizard needs every challenge plugin loaded and active, and
             // the note detector's playSong wrapper installed (the in-play HUD).
@@ -9357,7 +9282,7 @@ function createNoteDetector(options = {}) {
                 ${canOverride && !challenge.ready
                     ? '<button type="button" class="nd-cal-ready-override w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300">Continue anyway (challenge may miss note detection)</button>'
                     : ''}`;
-        } else if (step === 9) {
+        } else if (step === 8) {
             if (wiz.complete) {
                 html = _calWizardCompletionHtml(wiz);
             } else {
@@ -9507,54 +9432,6 @@ function createNoteDetector(options = {}) {
             };
         }
 
-        // ── Gameplay-settings step controls ──
-        // Same globals the Settings page uses (window.persistSetting,
-        // window.setMastery, …), so wizard edits and Settings edits write the
-        // same settings.
-        const gpSet = (cls, fn) => {
-            const el = body.querySelector(cls);
-            if (el) el.addEventListener('change', () => fn(el));
-        };
-        const gpSetInput = (cls, valCls, fn) => {
-            const el = body.querySelector(cls);
-            if (el) el.addEventListener('input', () => {
-                const v = body.querySelector(valCls);
-                if (v) v.textContent = fn(el);
-            });
-        };
-        gpSet('.nd-cal-gp-lefty', (el) => {
-            if (window.highway && typeof window.highway.setLefty === 'function') window.highway.setLefty(el.checked);
-        });
-        gpSetInput('.nd-cal-gp-mastery', '.nd-cal-gp-mastery-val', (el) => {
-            if (typeof window.setMastery === 'function') window.setMastery(el.value);
-            return el.value + '%';
-        });
-        gpSetInput('.nd-cal-gp-avoffset', '.nd-cal-gp-avoffset-val', (el) => {
-            if (typeof window.setAvOffsetMs === 'function') window.setAvOffsetMs(el.value);
-            return (Number(el.value) >= 0 ? '+' : '') + el.value + ' ms';
-        });
-        gpSet('.nd-cal-gp-countdown', (el) => {
-            if (typeof window.setCountdownBeforeSong === 'function') window.setCountdownBeforeSong(el.checked);
-        });
-        gpSet('.nd-cal-gp-upnext', (el) => {
-            if (typeof window.setShowUpNext === 'function') window.setShowUpNext(el.checked);
-        });
-        gpSet('.nd-cal-gp-autoplay', (el) => {
-            if (typeof window.setAutoplayExit === 'function') window.setAutoplayExit(el.checked);
-        });
-        gpSet('.nd-cal-gp-confirmexit', (el) => {
-            if (typeof window.setConfirmExitSong === 'function') window.setConfirmExitSong(el.checked);
-        });
-        gpSet('.nd-cal-gp-arrangement', (el) => {
-            if (typeof window.persistSetting === 'function') window.persistSetting('default_arrangement', el.value);
-        });
-        gpSet('.nd-cal-gp-misspenalty', (el) => {
-            if (typeof window.persistSetting === 'function') window.persistSetting('miss_penalty', el.value);
-        });
-        gpSet('.nd-cal-gp-failbehavior', (el) => {
-            if (typeof window.persistSetting === 'function') window.persistSetting('fail_behavior', el.value);
-        });
-
         const readyOverride = body.querySelector('.nd-cal-ready-override');
         if (readyOverride) {
             readyOverride.onclick = () => {
@@ -9569,12 +9446,12 @@ function createNoteDetector(options = {}) {
         // in-play HUD). The override button on the ready step (after a bounded
         // wait) lets a stuck user through.
         const missing = _calWizardStepMissingPlugins(step);
-        const challenge = (step === 8 || step === 9) ? _calWizardChallengeReady() : null;
+        const challenge = (step === 7 || step === 8) ? _calWizardChallengeReady() : null;
         const blocked = missing.length > 0 || (challenge && !challenge.ready);
-        if (nextBtn && step < 9 && blocked && !wiz.pluginWaitOverride) {
+        if (nextBtn && step < 8 && blocked && !wiz.pluginWaitOverride) {
             nextBtn.disabled = true;
             nextBtn.classList.add('opacity-60', 'cursor-not-allowed');
-            nextBtn.textContent = step === 8 ? 'Waiting for plugins…' : 'Waiting…';
+            nextBtn.textContent = step === 7 ? 'Waiting for plugins…' : 'Waiting…';
         }
         if (missing.length > 0 && !wiz.pluginWaitOverride && step !== 8) {
             const psRows = (wiz.pluginStatus && wiz.pluginStatus.rows) || [];
@@ -9587,7 +9464,7 @@ function createNoteDetector(options = {}) {
             banner.textContent = 'Waiting for plugin' + (missing.length > 1 ? 's' : '') + ' to load: ' + names + '…';
             body.insertBefore(banner, body.firstChild);
         }
-        if (step === 9 && challenge && !challenge.ready && !wiz.pluginWaitOverride) {
+        if (step === 8 && challenge && !challenge.ready && !wiz.pluginWaitOverride) {
             // Final check before the challenge: Apply/Finish both close the
             // wizard into the challenge flow, so both wait for readiness.
             const applyGate = body.querySelector('.nd-cal-apply-safe');
@@ -9600,7 +9477,7 @@ function createNoteDetector(options = {}) {
             body.insertBefore(banner, body.firstChild);
         }
 
-        if (step >= 1 && step <= 6) _calWizardRefreshLive();
+        if (step >= 1 && step <= 5) _calWizardRefreshLive();
 
         // The Timing step does NOT auto-minimize: a later tester reported the
         // step "does not load" because the card vanished the instant they
@@ -9615,7 +9492,7 @@ function createNoteDetector(options = {}) {
         if (_calWizardState.tunerMinimized) {
             _calWizardSetTunerMinimized(false);
         }
-        if (_calWizardState.step >= 9) return;
+        if (_calWizardState.step >= 8) return;
         _calWizardState.step++;
         renderCalibrationWizard();
     }
@@ -9681,7 +9558,7 @@ function createNoteDetector(options = {}) {
                 return;
             }
             if (_calWizardState && !_calWizardState.tunerMinimized
-                && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
+                && _calWizardState.step >= 1 && _calWizardState.step <= 5) {
                 _calWizardRefreshLive();
             }
         }, 200);
