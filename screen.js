@@ -2897,14 +2897,9 @@ function createNoteDetector(options = {}) {
     // to 'guitar' on every resolve when no chart is loaded, which would clobber a
     // bass calibration; honor this override while no real song tuning exists.
     let _calWizardForceArrangement = null;
-    const _CAL_WIZARD_NOTE_CHECK_DEFS = [
-        { id: 'lowE', string: 0, fallbackLabel: 'Low E', fallbackMidi: 40 },
-        { id: 'openA', string: 1, fallbackLabel: 'Open A', fallbackMidi: 45 },
-    ];
     const _CAL_WIZARD_STEPS = [
         { id: 'welcome', title: 'Welcome' },
         { id: 'audio', title: 'Audio Input' },
-        { id: 'tuner', title: 'Tuner' },
         { id: 'noise', title: 'Noise Floor' },
         { id: 'signal', title: 'Signal Level' },
         { id: 'notes', title: 'Note Detection' },
@@ -7372,18 +7367,6 @@ function createNoteDetector(options = {}) {
     const _CAL_WIZARD_PAUSE_RETRY_DELAYS_MS = [0, 150, 500, 1200, 2500, 4000];
     let _calWizardPauseRetryTimers = [];
 
-    function _calWizardDefaultAllStringsState() {
-        return {
-            running: false,
-            index: 0,
-            ids: [],
-            complete: false,
-            failedId: null,
-            detailsOpen: false,
-            message: null,
-        };
-    }
-
     function _calWizardClearPauseRetries() {
         _calWizardPauseRetryTimers.forEach((id) => clearTimeout(id));
         _calWizardPauseRetryTimers = [];
@@ -7397,7 +7380,9 @@ function createNoteDetector(options = {}) {
             noise: null,
             signal: null,
             notes: {},
-            allStrings: _calWizardDefaultAllStringsState(),
+            // Tuner-style auto-detection progress for the note-detection step
+            // ({ id, count }: consecutive matching ticks for one string).
+            stringAutoDetect: null,
             // Standalone instrument preset chosen in the note-detection step
             // (4/5/6-string bass, 6/7/8-string guitar); null = auto from song.
             selectedInstrumentConfig: null,
@@ -7513,71 +7498,6 @@ function createNoteDetector(options = {}) {
     function _calWizardSetChannelProbeStatus(html) {
         const el = _calWizardEl && _calWizardEl.querySelector('.nd-cal-channel-probe-status');
         if (el) el.innerHTML = html;
-    }
-
-    function _calWizardSetTunerOpenStatus(message, tone) {
-        const el = _calWizardEl && _calWizardEl.querySelector('.nd-cal-tuner-open-status');
-        if (!el) return;
-        if (!message) {
-            el.innerHTML = '';
-            return;
-        }
-        const cls = tone === 'warn' ? 'text-amber-200/90' : 'text-gray-400';
-        el.innerHTML = `<span class="${cls}">${message}</span>`;
-    }
-
-    function _calWizardIsTunerUiVisible() {
-        const el = document.getElementById('tuner-plugin-ui');
-        if (!el || el.classList.contains('hidden')) return false;
-        const cs = window.getComputedStyle(el);
-        return cs.display !== 'none' && cs.visibility !== 'hidden';
-    }
-
-    async function _calWizardWaitForTunerUiVisible(maxMs) {
-        const deadline = Date.now() + maxMs;
-        while (Date.now() < deadline) {
-            if (_calWizardIsTunerUiVisible()) return true;
-            await _calWizardSleep(100);
-        }
-        return _calWizardIsTunerUiVisible();
-    }
-
-    // Open the tuner EMBEDDED in the wizard's tuner step: the tuner panel is
-    // moved into the step's .nd-cal-tuner-embed host and the wizard stays
-    // visible (tester feedback: the old flow hid the wizard behind the tuner,
-    // and after signal capture the wizard was gone with only the tuner left).
-    // Falls back to the legacy floating + minimize-wizard flow when the tuner
-    // plugin predates window.tuner.embedInto.
-    async function _calWizardEmbedTuner() {
-        if (!window.tuner || typeof window.tuner.enable !== 'function') {
-            _calWizardSetTunerOpenStatus(
-                'Tuner plugin is not loaded. Enable the Tuner plugin, then try again.', 'warn');
-            return;
-        }
-        const host = _calWizardEl && _calWizardEl.querySelector('.nd-cal-tuner-embed');
-        if (!host) return;
-        _calWizardSetTunerOpenStatus('Opening tuner…', 'neutral');
-        try {
-            await window.tuner.enable();
-        } catch (e) {
-            console.warn('[note_detect] tuner enable:', e);
-            _calWizardSetTunerOpenStatus(
-                'Tuner did not open. Check microphone permission or open the Tuner from the bottom toolbar.', 'warn');
-            return;
-        }
-        if (typeof window.tuner.embedInto === 'function' && window.tuner.embedInto(host)) {
-            _calWizardSetTunerOpenStatus('', 'neutral');
-            return;
-        }
-        // Downlevel tuner plugin (no embedInto): legacy floating flow.
-        const visible = await _calWizardWaitForTunerUiVisible(4000);
-        if (visible) {
-            _calWizardSetTunerOpenStatus('', 'neutral');
-            _calWizardSetTunerMinimized(true);
-            return;
-        }
-        _calWizardSetTunerOpenStatus(
-            'Tuner did not open. Check microphone permission or open the Tuner from the bottom toolbar.', 'warn');
     }
 
     function _calWizardFinishLevelSample(wiz, kind, samples) {
@@ -7838,79 +7758,30 @@ function createNoteDetector(options = {}) {
         return hasTuning ? `String ${n} (${note})` : `String ${n}`;
     }
 
-    function _calWizardResolveNoteChecks(opts) {
-        const mode = (opts && opts.mode === 'all') ? 'all' : 'quick';
+    // Every open string of the current instrument/song tuning, low to high.
+    // The Note Detection step auto-detects each one (tuner-style), so this
+    // single list is both the rendered rows and the auto-detect targets. The
+    // target note is always named so the player knows exactly what to play
+    // (tester feedback: the generic "Low E / Open A" tests were unclear) — from
+    // the song tuning, a chosen standalone preset, or the standard fallback.
+    function _calWizardResolveNoteChecks() {
         const ctx = _calWizardResolveNoteCheckContext();
-        const { hasTuning, stringCount } = ctx;
-        // Always name the target note so the player knows exactly what to play
-        // (tester feedback: the generic "Low E / Open A" tests were unclear).
-        // We always resolve a concrete expectedMidi below — from the song tuning,
-        // a chosen standalone preset, or the standard-tuning fallback — so the
-        // label can always show it. An extended-range player who hasn't loaded a
-        // song still sees the standard-tuning note and can pick a preset to refine.
-        const showNote = true;
-        if (mode === 'all') {
-            const specs = [];
-            for (let s = 0; s < stringCount; s++) {
-                const expectedMidi = _calWizardOpenStringMidi(s, ctx);
-                if (!Number.isFinite(expectedMidi)) continue;
-                const expectedNote = _ndMidiToName(expectedMidi);
-                specs.push({
-                    id: 'openS' + s,
-                    label: _calWizardOpenStringLabel(s, stringCount, expectedNote, showNote),
-                    expectedMidi,
-                    expectedNote,
-                    string: s,
-                    displayString: _calWizardOpenStringDisplayNum(s, stringCount),
-                });
-            }
-            return specs;
-        }
+        const { stringCount } = ctx;
         const specs = [];
-        for (const def of _CAL_WIZARD_NOTE_CHECK_DEFS) {
-            if (def.string >= stringCount) continue;
-            let expectedMidi = _calWizardOpenStringMidi(def.string, ctx);
-            if (!Number.isFinite(expectedMidi)) expectedMidi = def.fallbackMidi;
+        for (let s = 0; s < stringCount; s++) {
+            const expectedMidi = _calWizardOpenStringMidi(s, ctx);
+            if (!Number.isFinite(expectedMidi)) continue;
             const expectedNote = _ndMidiToName(expectedMidi);
-            const label = def.string === 0
-                ? (showNote ? `Open low string (${expectedNote})` : def.fallbackLabel)
-                : (showNote ? `Open 2nd string (${expectedNote})` : def.fallbackLabel);
             specs.push({
-                id: def.id,
-                label,
+                id: 'openS' + s,
+                label: _calWizardOpenStringLabel(s, stringCount, expectedNote, true),
                 expectedMidi,
                 expectedNote,
-                string: def.string,
+                string: s,
+                displayString: _calWizardOpenStringDisplayNum(s, stringCount),
             });
         }
-        if (!specs.length) {
-            return _CAL_WIZARD_NOTE_CHECK_DEFS.map((def) => ({
-                id: def.id,
-                label: def.fallbackLabel,
-                expectedMidi: def.fallbackMidi,
-                expectedNote: _ndMidiToName(def.fallbackMidi),
-                string: def.string,
-            }));
-        }
         return specs;
-    }
-
-    function _calWizardFindNoteCheckSpec(noteId) {
-        if (!noteId) return null;
-        const quick = _calWizardResolveNoteChecks({ mode: 'quick' });
-        const hit = quick.find((n) => n.id === noteId);
-        if (hit) return hit;
-        const all = _calWizardResolveNoteChecks({ mode: 'all' });
-        return all.find((n) => n.id === noteId) || null;
-    }
-
-    // The open strings shown (and run) in the advanced panel: every open string
-    // EXCEPT the ones the quick Open low / Open 2nd checks above already cover.
-    // Shared by the render and the Run-All sweep so the run only ever targets
-    // strings that have a visible row (with its own inline countdown/result).
-    function _calWizardResolveAdvancedStringChecks() {
-        const quickStrings = new Set(_calWizardResolveNoteChecks({ mode: 'quick' }).map((s) => s.string));
-        return _calWizardResolveNoteChecks({ mode: 'all' }).filter((s) => !quickStrings.has(s.string));
     }
 
     // Result-cell colour + text for one open-string check, shared by the static
@@ -7925,22 +7796,6 @@ function createNoteDetector(options = {}) {
             return { cls: 'text-amber-200/90', txt: `Failed — expected ${r.expectedNote || spec.expectedNote}` };
         }
         return { cls: 'text-gray-500', txt: `Expected ${spec.expectedNote}` };
-    }
-
-    // The open-string check (if any) currently counting down or listening, so
-    // its inline row cell shows live status instead of the stored result. The
-    // countdown autoCapture encodes the note id in `kind` ("note_<id>"); the
-    // listening autoCapture carries it on `noteId`.
-    function _calWizardActiveNoteCapture() {
-        const ac = _calWizardState && _calWizardState.autoCapture;
-        if (!ac) return null;
-        if (ac.phase === 'countdown' && typeof ac.kind === 'string' && ac.kind.startsWith('note_')) {
-            return { id: ac.kind.slice(5), phase: 'countdown', left: Number.isFinite(ac.left) ? ac.left : '' };
-        }
-        if (ac.kind === 'note' && ac.noteId) {
-            return { id: ac.noteId, phase: 'listening' };
-        }
-        return null;
     }
 
     // Wizard-only raw pitch readout — bypasses chart-aware detectedDisplayMidi.
@@ -7967,165 +7822,67 @@ function createNoteDetector(options = {}) {
         return Math.abs(_ndNearestOctaveCents(detectedMidi, targetMidi)) <= centsTol;
     }
 
-    function _calWizardStopAllStringsRun(reason, opts) {
+    // Tuner-style auto-detection for the Note Detection step: while the step
+    // is open the wizard listens continuously and marks an open string OK the
+    // moment a stable pitch matching its target is heard — no per-string
+    // button, no sweep. Every string "OK — heard" means the instrument is
+    // verified in tune. Driven by _calWizardRefreshLive's 200 ms tick, so the
+    // stability window below is counted in ticks (~600 ms for 3).
+    const _CAL_WIZARD_STRING_AUTO_TICKS = 3;
+    function _calWizardAutoDetectStrings(snap) {
         const wiz = _calWizardState;
-        if (!wiz || !wiz.allStrings) return;
-        const seq = wiz.allStrings;
-        const wasRunning = seq.running;
-        seq.running = false;
-        if (opts && opts.clearMessage) seq.message = null;
-        if (reason === 'restart') {
-            seq.complete = false;
-            seq.failedId = null;
-        }
-        if (wasRunning && wiz.autoCapture && wiz.autoCapture.kind === 'note') {
-            const nid = wiz.autoCapture.noteId;
-            if (nid && seq.ids && seq.ids.includes(nid)) {
-                _calWizardStopAutoCapture();
-            }
-        }
-    }
-
-    function _calWizardStartAllStringsRun() {
-        const wiz = _calWizardState;
-        if (!wiz) return;
-        const snap = getCalibrationSnapshot();
-        if (!snap.enabled) {
-            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
-            return;
-        }
-        _calWizardStopAllStringsRun('restart', { clearMessage: true });
-        // Sweep only the advanced rows (the two lowest strings are covered by
-        // the quick Open low / Open 2nd checks) so every run target has a
-        // visible row to show its countdown/result.
-        const specs = _calWizardResolveAdvancedStringChecks();
+        if (!wiz || wiz.step !== 4) return;
+        const specs = _calWizardResolveNoteChecks();
         if (!specs.length) return;
-        for (const key of Object.keys(wiz.notes)) {
-            if (key.startsWith('openS')) delete wiz.notes[key];
-        }
-        const ids = specs.map((s) => s.id);
-        const first = specs[0];
-        wiz.allStrings = {
-            running: true,
-            index: 0,
-            ids,
-            complete: false,
-            failedId: null,
-            detailsOpen: true,
-            message: first ? `Play ${first.label}` : null,
-        };
-        renderCalibrationWizard();
-        _calWizardStartNoteCapture(ids[0]);
-    }
-
-    function _calWizardAdvanceAllStringsRun(noteId, ok) {
-        const wiz = _calWizardState;
-        if (!wiz || !wiz.allStrings || !wiz.allStrings.running) return false;
-        const seq = wiz.allStrings;
-        const expectedId = seq.ids[seq.index];
-        if (noteId !== expectedId) return true;
-        seq.detailsOpen = true;
-        if (!ok) {
-            seq.running = false;
-            seq.failedId = noteId;
-            const spec = _calWizardFindNoteCheckSpec(noteId);
-            const label = spec ? spec.label : noteId;
-            seq.message = `${label} did not pass — retry the run or check manually.`;
-            renderCalibrationWizard();
-            return true;
-        }
-        seq.index += 1;
-        if (seq.index >= seq.ids.length) {
-            seq.running = false;
-            seq.complete = true;
-            seq.message = 'Remaining strings passed.';
-            _calWizardSetAutoStatus('<span class="text-green-300/90">Remaining strings passed.</span>');
-            renderCalibrationWizard();
-            return true;
-        }
-        const nextId = seq.ids[seq.index];
-        const nextSpec = _calWizardFindNoteCheckSpec(nextId);
-        seq.message = nextSpec ? `Play ${nextSpec.label}` : `Play string ${seq.index + 1}`;
-        renderCalibrationWizard();
-        _calWizardStartNoteCapture(nextId);
-        return true;
-    }
-
-    function _calWizardStartNoteCapture(noteId) {
-        const wiz = _calWizardState;
-        if (!wiz) return;
-        const snap = getCalibrationSnapshot();
-        if (!snap.enabled) {
-            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
-            if (wiz.allStrings && wiz.allStrings.running) {
-                _calWizardStopAllStringsRun('detect-off');
-            }
+        if (!snap || !snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on to verify your strings.</span>');
             return;
         }
-        _calWizardBeginCountdownThen('note_' + noteId, 2, () => {
-            const spec = _calWizardFindNoteCheckSpec(noteId);
-            if (!spec) return;
-            _calWizardStopAutoCapture();
-            const stable = [];
-            const started = Date.now();
-            const maxWait = 14000;
-            wiz.autoCapture = { kind: 'note', noteId, stable, started };
-            const tick = () => {
-                const s = getCalibrationSnapshot();
-                const heardMidi = _calWizardRawPitchFields().rawMidi;
-                if (_calWizardMidiNearTarget(heardMidi, spec.expectedMidi, 100)) {
-                    stable.push({ midi: heardMidi, conf: detectedConfidence, t: Date.now() });
-                } else {
-                    stable.length = 0;
-                }
-                const elapsed = Date.now() - started;
-                if (stable.length >= 4) {
-                    const last = stable[stable.length - 1];
-                    wiz.notes[noteId] = {
-                        ok: true,
-                        label: spec.label,
-                        expectedNote: spec.expectedNote,
-                        expectedMidi: spec.expectedMidi,
-                        heardNote: _ndMidiToName(last.midi),
-                        confidencePct: Math.round(last.conf * 100),
-                        at: Date.now(),
-                    };
-                    _calWizardStopAutoCapture();
-                    _calWizardSetAutoStatus(
-                        `<span class="text-green-300/90">${spec.label} OK</span> — `
-                        + `expected ${spec.expectedNote}, heard ${wiz.notes[noteId].heardNote} `
-                        + `(${wiz.notes[noteId].confidencePct}% conf)`);
-                    if (!_calWizardAdvanceAllStringsRun(noteId, true)) {
-                        renderCalibrationWizard();
-                    }
-                    return;
-                }
-                _calWizardSetAutoStatus(
-                    `<span class="text-cyan-300/90">Listening for ${spec.label}…</span> `
-                    + (s.heardConfidencePct != null
-                        ? `Expected: ${spec.expectedNote} · Heard: ${s.rawHeardNote ?? s.heardNote} · ${s.heardConfidencePct}%`
-                        : `Expected: ${spec.expectedNote} · Channel: ${s.channel || '—'} · Live: `
-                        + calibrationFormatLevel(s.inputLevelPct, s.inputPeakPct)));
-                if (elapsed >= maxWait) {
-                    _calWizardStopAutoCapture();
-                    wiz.notes[noteId] = {
-                        ok: false,
-                        label: spec.label,
-                        expectedNote: spec.expectedNote,
-                        expectedMidi: spec.expectedMidi,
-                        at: Date.now(),
-                    };
-                    _calWizardSetAutoStatus(
-                        `<span class="text-amber-200/90">${spec.label}: no stable note detected. `
-                        + `Expected ${spec.expectedNote}. Retry.</span>`);
-                    if (!_calWizardAdvanceAllStringsRun(noteId, false)) {
-                        renderCalibrationWizard();
-                    }
-                }
+        const heard = specs.filter((s) => wiz.notes[s.id] && wiz.notes[s.id].ok);
+        if (heard.length >= specs.length) {
+            _calWizardSetAutoStatus(`<span class="text-green-300/90">All ${specs.length} strings heard — your instrument is in tune.</span>`);
+            return;
+        }
+        const rawMidi = Number.isFinite(snap.rawMidi) ? snap.rawMidi : null;
+        let matched = null;
+        if (rawMidi != null) {
+            for (const spec of specs) {
+                if (wiz.notes[spec.id] && wiz.notes[spec.id].ok) continue;
+                if (_calWizardMidiNearTarget(rawMidi, spec.expectedMidi, 100)) { matched = spec; break; }
+            }
+        }
+        const st = wiz.stringAutoDetect || (wiz.stringAutoDetect = { id: null, count: 0 });
+        if (matched && matched.id === st.id) {
+            st.count += 1;
+        } else {
+            st.id = matched ? matched.id : null;
+            st.count = matched ? 1 : 0;
+        }
+        if (matched && st.count >= _CAL_WIZARD_STRING_AUTO_TICKS) {
+            const heardNote = _ndMidiToName(rawMidi);
+            const confPct = snap.heardConfidencePct != null
+                ? snap.heardConfidencePct
+                : Math.round(detectedConfidence * 100);
+            wiz.notes[matched.id] = {
+                ok: true,
+                label: matched.label,
+                expectedNote: matched.expectedNote,
+                expectedMidi: matched.expectedMidi,
+                heardNote,
+                confidencePct: confPct,
+                at: Date.now(),
             };
-            tick();
-            wiz.autoCapture.intervalId = setInterval(tick, 150);
-        });
+            st.id = null;
+            st.count = 0;
+            _calWizardSetAutoStatus(
+                `<span class="text-green-300/90">${matched.label} OK</span> — `
+                + `heard ${heardNote} (${confPct}% conf)`);
+            return;
+        }
+        const next = specs.find((s) => !(wiz.notes[s.id] && wiz.notes[s.id].ok));
+        _calWizardSetAutoStatus(
+            `<span class="text-cyan-300/90">Listening — play each open string · ${heard.length}/${specs.length} heard</span>`
+            + (next ? ` Next: ${next.expectedNote}` : ''));
     }
 
     function _calWizardCaptureTimingSnapshot() {
@@ -8146,8 +7903,9 @@ function createNoteDetector(options = {}) {
         renderCalibrationWizard();
     }
 
-    // Hides the wizard card and passes clicks through — reused for tuner step and
-    // timing play-along (not tuner-specific despite the name).
+    // Hides the wizard card and passes clicks through — used by the timing
+    // step's "Minimize Wizard — Play Song" and the timed play-along (the name
+    // is legacy; the tuner step no longer exists).
     function _calWizardSetTunerMinimized(minimized) {
         const wiz = _calWizardState;
         if (!_calWizardEl || !wiz) return;
@@ -8585,32 +8343,6 @@ function createNoteDetector(options = {}) {
                 ${tone3000Section}`;
     }
 
-    function _calWizardReleaseTuner() {
-        // Unembed FIRST (while the panel is still in its host) so the tuner
-        // plugin restores its floating panel instead of leaving the embedded
-        // element to die with the wizard step's DOM.
-        try {
-            if (window.tuner && typeof window.tuner.unembed === 'function') {
-                window.tuner.unembed();
-            }
-        } catch (e) {
-            console.warn('[note_detect] cal wizard tuner unembed:', e);
-        }
-        try {
-            if (window.tuner && typeof window.tuner.disable === 'function') {
-                window.tuner.disable();
-            }
-        } catch (e) {
-            console.warn('[note_detect] cal wizard tuner release:', e);
-        }
-        if (_calWizardState) _calWizardSetTunerMinimized(false);
-        if (enabled) {
-            try { restartAudio(); } catch (e) {
-                console.warn('[note_detect] cal wizard restartAudio after tuner release:', e);
-            }
-        }
-    }
-
     function _calWizardApplySafeSettings(wiz) {
         const applied = {};
         const rec = wiz.recommended || {};
@@ -9042,7 +8774,6 @@ function createNoteDetector(options = {}) {
         // Capture launchCalibration() callback context before teardown nulls it.
         const _calHadWizard = !!_calWizardEl;
         const _calAppliedResult = (_calWizardState && _calWizardState.applied) || null;
-        _calWizardStopAllStringsRun('close');
         _calWizardClearPauseRetries();
         _calWizardStopAutoCapture();
         // Re-assert the calibrated engine input gain on close (the just-applied
@@ -9052,7 +8783,6 @@ function createNoteDetector(options = {}) {
         // No-op when never calibrated (engineInputGain == null).
         _ndApplyEngineGain();
         _calWizardStopTimedPlayAlong('close');
-        _calWizardReleaseTuner();
         if (_calWizardTick) {
             clearInterval(_calWizardTick);
             _calWizardTick = null;
@@ -9096,7 +8826,7 @@ function createNoteDetector(options = {}) {
         if (live) live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
         const heard = _calWizardEl.querySelector('.nd-cal-heard');
         if (heard) {
-            if (wiz.step === 5) {
+            if (wiz.step === 4) {
                 heard.textContent = snap.heardConfidencePct != null
                     ? `Now hearing: ${snap.rawHeardNote ?? snap.heardNote} · ${snap.heardConfidencePct}% confidence`
                     : `Now hearing: nothing yet — play a note · Channel: ${snap.channel || '—'} · Live: `
@@ -9109,17 +8839,12 @@ function createNoteDetector(options = {}) {
         }
         const debugEl = _calWizardEl.querySelector('.nd-cal-pitch-debug');
         if (debugEl) {
-            if (wiz.step === 5) {
-                let expectNote = '—';
-                if (wiz.autoCapture && wiz.autoCapture.kind === 'note' && wiz.autoCapture.noteId) {
-                    const active = _calWizardFindNoteCheckSpec(wiz.autoCapture.noteId);
-                    if (active) expectNote = active.expectedNote;
-                }
-                if (expectNote === '—') {
-                    const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
-                    const primary = noteSpecs[0];
-                    if (primary) expectNote = primary.expectedNote;
-                }
+            if (wiz.step === 4) {
+                // Show the next string still waiting for its OK — that is what
+                // the player should play (tuner-style auto-detection).
+                const specs = _calWizardResolveNoteChecks();
+                const next = specs.find((s) => !(wiz.notes[s.id] && wiz.notes[s.id].ok));
+                const expectNote = next ? next.expectedNote : '—';
                 if (snap.heardConfidencePct != null) {
                     let line = `Expected: ${expectNote} · Heard: ${snap.rawHeardNote ?? '—'}`;
                     if (snap.displayHeardNote && snap.displayHeardNote !== snap.rawHeardNote) {
@@ -9149,21 +8874,16 @@ function createNoteDetector(options = {}) {
                 debugEl.classList.add('hidden');
             }
         }
-        if (wiz.step === 5) {
+        if (wiz.step === 4) {
+            // Tuner-style auto-detect first, so a string verified this tick
+            // repaints OK immediately; then refresh every row from wiz.notes.
+            _calWizardAutoDetectStrings(snap);
             const rowCells = _calWizardEl.querySelectorAll('.nd-cal-all-row-result');
             if (rowCells.length) {
-                const active = _calWizardActiveNoteCapture();
                 const byId = {};
-                _calWizardResolveNoteChecks({ mode: 'all' }).forEach((s) => { byId[s.id] = s; });
+                _calWizardResolveNoteChecks().forEach((s) => { byId[s.id] = s; });
                 rowCells.forEach((cell) => {
                     const id = cell.getAttribute('data-note-result');
-                    if (active && active.id === id) {
-                        cell.className = 'nd-cal-all-row-result text-cyan-300/90 text-[10px] text-right shrink-0';
-                        cell.innerHTML = active.phase === 'countdown'
-                            ? `Get ready… <strong class="text-white">${active.left}</strong>`
-                            : 'Listening…';
-                        return;
-                    }
                     const spec = byId[id];
                     if (!spec) return;
                     const res = _calWizardNoteResultParts(spec);
@@ -9259,16 +8979,16 @@ function createNoteDetector(options = {}) {
         const wiz = _calWizardState;
         const meta = _CAL_WIZARD_STEPS[step] || { title: 'Step' };
         title.textContent = `Calibration Wizard — ${meta.title}`;
-        if (backBtn) backBtn.style.visibility = step > 0 && step < 8 ? 'visible' : 'hidden';
+        if (backBtn) backBtn.style.visibility = step > 0 && step < 7 ? 'visible' : 'hidden';
         if (nextBtn) {
-            if (step >= 8) {
+            if (step >= 7) {
                 nextBtn.style.display = 'none';
             } else {
                 nextBtn.style.display = '';
-                nextBtn.textContent = step === 7 ? 'Continue to Apply' : 'Next';
+                nextBtn.textContent = step === 6 ? 'Continue to Apply' : 'Next';
             }
         }
-        if (step === 7) _calWizardBuildSafeRecommendations(wiz, snap);
+        if (step === 6) _calWizardBuildSafeRecommendations(wiz, snap);
 
         let html = '';
         if (step === 0) {
@@ -9312,14 +9032,6 @@ function createNoteDetector(options = {}) {
                 <p class="text-[10px] text-gray-500">The <strong>Input Channel</strong> dropdown below only applies to browser microphone fallback — not desktop audio.</p>
                 <p class="text-[10px] text-amber-200/80">If stuck: check USB cable, interface gain, turn Detect on, and strum loudly during the test.</p>`;
         } else if (step === 2) {
-            html = `
-                <p class="text-gray-300 text-xs mb-2">Tune your guitar with the <strong class="text-gray-200">tuner</strong> below — it lives inside this step.</p>
-                <p class="text-[10px] text-amber-200/80 mb-2">If notes miss often later: retune here before continuing.</p>
-                <div class="nd-cal-tuner-embed mb-2 min-h-[4rem] rounded-lg border border-dashed border-gray-600/60"></div>
-                <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Show Tuner</button>
-                <div class="nd-cal-tuner-open-status text-[11px] mb-2 min-h-[1.5rem]"></div>
-                <button type="button" class="nd-cal-tuned w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">I'm Tuned — Continue</button>`;
-        } else if (step === 3) {
             const nDone = wiz.noise && wiz.noise.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
@@ -9330,7 +9042,7 @@ function createNoteDetector(options = {}) {
                     : 'Ready to measure room noise.'}</div>
                 <button type="button" class="nd-cal-start-noise w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${nDone ? 'Retry Noise Capture' : 'Start Noise Capture'}</button>
                 <p class="text-[10px] text-gray-500">If <strong>Too noisy</strong>: lower input gain, move away from amps/fans, or try the dry (Ch 1) input.</p>`;
-        } else if (step === 4) {
+        } else if (step === 3) {
             const sDone = wiz.signal && wiz.signal.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
@@ -9341,8 +9053,8 @@ function createNoteDetector(options = {}) {
                     : 'Ready to measure your playing level.'}</div>
                 <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
                 <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
-        } else if (step === 5) {
-            const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
+        } else if (step === 4) {
+            const noteSpecs = _calWizardResolveNoteChecks();
             // Standalone (no song): let the player pick their instrument so the
             // open-string targets cover 5/6-string bass and 7/8-string guitar.
             const _calCtx = _calWizardResolveNoteCheckContext();
@@ -9358,77 +9070,26 @@ function createNoteDetector(options = {}) {
                     </select>
                     <p class="text-[9px] text-gray-500 mt-1">Pick a 4/5/6-string bass or 6/7/8-string guitar so the open-string targets match your instrument.</p>
                 </div>`;
-            const allStr = wiz.allStrings || _calWizardDefaultAllStringsState();
-            const allRunning = !!allStr.running;
-            const detailsOpen = !!(allStr.detailsOpen || allStr.running || allStr.complete || allStr.failedId);
-            const noteRowHtml = (spec, compact) => {
+            // One live row per open string — _calWizardRefreshLive repaints
+            // each cell from wiz.notes as auto-detection hears strings.
+            const noteRows = noteSpecs.map((spec) => {
                 const res = _calWizardNoteResultParts(spec);
-                const labelCls = compact ? 'text-[10px]' : 'text-xs';
-                return `<div class="flex justify-between py-1 border-b border-gray-700/50 gap-2">
-                    <span class="text-gray-300 ${labelCls}">${spec.label}</span>
-                    <span class="${res.cls} text-[10px] text-right shrink-0">${res.txt}</span></div>`;
-            };
-            const noteRows = noteSpecs.map((spec) => noteRowHtml(spec, false)).join('');
-            const noteButtons = noteSpecs.map((spec) =>
-                `<button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-1" data-note="${spec.id}">Check ${spec.label}</button>`
-            ).join('');
-            const allBtnDisabled = allRunning ? ' disabled' : '';
-            const allBtnDisabledCls = allRunning ? ' opacity-50 cursor-not-allowed' : '';
-            // Per-string manual checks: skip the strings the quick Open low / Open
-            // 2nd checks above already cover — they were redundant (tester
-            // feedback). Each remaining string is one compact row: Check button +
-            // label + an inline result/countdown cell so the status is never
-            // scrolled off the bottom (kept live by _calWizardRefreshLive). Run-All
-            // sweeps this same set, so every run target has a visible row.
-            const advancedSpecs = _calWizardResolveAdvancedStringChecks();
-            const active = _calWizardActiveNoteCapture();
-            const allRows = advancedSpecs.map((spec) => {
-                let res;
-                if (active && active.id === spec.id) {
-                    res = active.phase === 'countdown'
-                        ? { cls: 'text-cyan-300/90', txt: `Get ready… ${active.left}` }
-                        : { cls: 'text-cyan-300/90', txt: 'Listening…' };
-                } else {
-                    res = _calWizardNoteResultParts(spec);
-                }
                 return `<div class="flex items-center gap-2 py-1 border-b border-gray-700/50">
-                    <button type="button" class="nd-cal-check-note-all shrink-0 px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[10px] text-gray-200${allBtnDisabledCls}" data-note="${spec.id}"${allBtnDisabled}>Check</button>
-                    <span class="text-gray-300 text-[10px] flex-1 min-w-0">${spec.label}</span>
+                    <span class="text-gray-300 text-xs flex-1 min-w-0">${spec.label}</span>
                     <span class="nd-cal-all-row-result ${res.cls} text-[10px] text-right shrink-0" data-note-result="${spec.id}">${res.txt}</span>
                 </div>`;
             }).join('');
-            let seqStatusHtml = '';
-            if (allStr.message) {
-                const seqCls = allStr.complete
-                    ? 'text-green-300/90'
-                    : allStr.failedId
-                        ? 'text-amber-200/90'
-                        : 'text-cyan-300/90';
-                seqStatusHtml = `<p class="text-[10px] ${seqCls} mb-2">${allStr.message}</p>`;
-            }
-            const runBtnLabel = allRunning ? 'Checking…' : 'Check All Remaining Strings';
-            const runBtnDisabled = allRunning ? ' disabled' : '';
-            const runBtnCls = allRunning ? ' opacity-60 cursor-not-allowed' : '';
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Quick check that feedBack hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play each open string</strong> — feedBack detects it automatically, like a tuner. When every string shows <strong class="text-gray-200">OK — heard</strong>, your instrument is in tune.</p>
                 <p class="text-[10px] text-gray-500 mb-2">Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.</p>
-                <p class="text-[10px] text-gray-500 mb-2">Load a song first for song tuning in the tuner.</p>
                 ${instrumentPickerHtml}
                 <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2 h-[2rem] overflow-y-auto">Now hearing: —</div>
                 <div class="nd-cal-pitch-debug text-[9px] text-gray-500 font-mono mb-1 hidden"></div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 h-[2.75rem] overflow-y-auto">—</div>
                 <div class="mb-2">${noteRows}</div>
-                ${noteButtons}
-                <details class="nd-cal-all-strings mt-3 mb-2"${detailsOpen ? ' open' : ''}>
-                    <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 py-1 select-none">Check remaining strings (advanced)</summary>
-                    <p class="text-[10px] text-gray-500 mt-2 mb-2">Optional — verify the remaining open strings against song tuning. The two lowest are covered by the Open low / Open 2nd checks above. Not required to continue.</p>
-                    <button type="button" class="nd-cal-run-all-strings w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${runBtnCls}"${runBtnDisabled}>${runBtnLabel}</button>
-                    ${seqStatusHtml}
-                    <div class="mb-2">${allRows}</div>
-                </details>
-                <p class="text-[10px] text-gray-500">If a check fails: retune, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
-        } else if (step === 6) {
+                <p class="text-[10px] text-gray-500">If a string never turns OK: retune it, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
+        } else if (step === 5) {
             const t = wiz.timing;
             const liveMed = snap.timingMedianMs;
             const liveN = (snap.diagnostic && snap.diagnostic.timing_error_ms_hits)
@@ -9449,13 +9110,13 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
                 <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
                 ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
-        } else if (step === 7) {
+        } else if (step === 6) {
             html = `
                 <p class="text-sm text-gray-200 mb-3">Review safe recommendations. Uncheck anything you do not want applied.</p>
                 ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: true })}
                 ${_calWizardReviewDetailsHtml(wiz)}
                 <p class="text-xs text-gray-500 mt-2"><strong class="text-gray-400">Never changed by this wizard:</strong> pitch tolerance, timing tolerance, chord leniency, clean timing/pitch thresholds, harmonic SNR, note verifier / scoring thresholds</p>`;
-        } else if (step === 8) {
+        } else if (step === 7) {
             if (wiz.complete) {
                 html = _calWizardCompletionHtml(wiz);
             } else {
@@ -9467,31 +9128,7 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-finish-no-apply w-full py-2.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300">Finish Without Applying</button>`;
             }
         }
-        // The tuner panel may be embedded in this step's host (tuner step).
-        // The innerHTML swap below would orphan it — detect that and re-attach
-        // it to the fresh host right after the swap.
-        let _reembedTuner = false;
-        if (step === 2 && window.tuner && typeof window.tuner.embedInto === 'function') {
-            const _host = body.querySelector('.nd-cal-tuner-embed');
-            if (_host && _host.querySelector('#tuner-plugin-ui')) _reembedTuner = true;
-        }
         body.innerHTML = html;
-        if (_reembedTuner) {
-            const _newHost = body.querySelector('.nd-cal-tuner-embed');
-            if (_newHost) window.tuner.embedInto(_newHost);
-        }
-
-        const openTuner = body.querySelector('.nd-cal-open-tuner');
-        if (openTuner) {
-            openTuner.onclick = () => { _calWizardEmbedTuner(); };
-        }
-        const tunedBtn = body.querySelector('.nd-cal-tuned');
-        if (tunedBtn) {
-            tunedBtn.onclick = () => {
-                _calWizardReleaseTuner();
-                calibrationWizardNext();
-            };
-        }
 
         const startNoise = body.querySelector('.nd-cal-start-noise');
         if (startNoise) startNoise.onclick = () => _calWizardStartNoiseCapture();
@@ -9518,43 +9155,16 @@ function createNoteDetector(options = {}) {
             };
         });
 
-        body.querySelectorAll('.nd-cal-check-note').forEach((btn) => {
-            btn.onclick = () => {
-                const id = btn.getAttribute('data-note');
-                if (id) _calWizardStartNoteCapture(id);
-            };
-        });
-
-        body.querySelectorAll('.nd-cal-check-note-all').forEach((btn) => {
-            btn.onclick = () => {
-                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
-                const id = btn.getAttribute('data-note');
-                if (id) _calWizardStartNoteCapture(id);
-            };
-        });
-
-        const runAllStrings = body.querySelector('.nd-cal-run-all-strings');
-        if (runAllStrings) {
-            runAllStrings.onclick = () => {
-                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
-                _calWizardStartAllStringsRun();
-            };
-        }
-
         const instrSelect = body.querySelector('.nd-cal-instrument-config');
         if (instrSelect) {
             instrSelect.onchange = () => {
                 if (_calWizardState) {
-                    // Stop any in-flight all-strings run / countdown / auto-capture
-                    // first — otherwise it can land a result for the OLD instrument
-                    // into the freshly reset state after the switch.
-                    _calWizardStopAllStringsRun('switch');
-                    _calWizardStopAutoCapture();
-                    _calWizardState.selectedInstrumentConfig = instrSelect.value || null;
                     // Expected open-string notes change with the instrument, so
-                    // drop stale per-string + quick-check results.
-                    _calWizardState.allStrings = _calWizardDefaultAllStringsState();
+                    // drop stale per-string results (and any in-flight
+                    // auto-detection) before re-rendering.
+                    _calWizardState.selectedInstrumentConfig = instrSelect.value || null;
                     _calWizardState.notes = {};
+                    _calWizardState.stringAutoDetect = null;
                 }
                 renderCalibrationWizard();
             };
@@ -9656,50 +9266,30 @@ function createNoteDetector(options = {}) {
             };
         }
 
-        if (step >= 1 && step <= 6) _calWizardRefreshLive();
+        if (step >= 1 && step <= 5) _calWizardRefreshLive();
 
-        // One-shot, per-step-entry auto-open of the Tuner step: the tuner is
-        // EMBEDDED into the step (the wizard stays visible). The guard is set
-        // BEFORE firing so the re-render this triggers can't recurse, and a
-        // step that didn't change never re-fires.
-        //
         // The Timing step does NOT auto-minimize: a later tester reported the
         // step "does not load" because the card vanished the instant they
         // reached it. The step keeps explicit "Minimize Wizard — Play Song" and
         // "Start Timed Play-Along Test" buttons (both minimize on click) so the
         // highway is still reachable on demand.
-        const enteredStep = wiz._autoEnterStep !== step;
-        wiz._autoEnterStep = step;
-        if (enteredStep && !wiz.complete && !wiz.tunerMinimized) {
-            if (step === 2) {
-                _calWizardEmbedTuner();
-            }
-        }
     }
 
     function calibrationWizardNext() {
         if (!_calWizardState) return;
-        _calWizardStopAllStringsRun('next');
         _calWizardStopAutoCapture();
-        if (_calWizardState.step === 2) {
-            _calWizardReleaseTuner();
-        } else if (_calWizardState.tunerMinimized) {
+        if (_calWizardState.tunerMinimized) {
             _calWizardSetTunerMinimized(false);
         }
-        if (_calWizardState.step >= 8) return;
+        if (_calWizardState.step >= 7) return;
         _calWizardState.step++;
         renderCalibrationWizard();
     }
 
     function calibrationWizardBack() {
         if (!_calWizardState || _calWizardState.step <= 0) return;
-        _calWizardStopAllStringsRun('back');
         _calWizardStopAutoCapture();
-        // Leaving the tuner step backwards too: release (unembed + disable)
-        // BEFORE the re-render destroys the step's embed host.
-        if (_calWizardState.step === 2) {
-            _calWizardReleaseTuner();
-        } else if (_calWizardState.tunerMinimized) {
+        if (_calWizardState.tunerMinimized) {
             _calWizardSetTunerMinimized(false);
         }
         _calWizardState.step--;
@@ -9757,7 +9347,7 @@ function createNoteDetector(options = {}) {
                 return;
             }
             if (_calWizardState && !_calWizardState.tunerMinimized
-                && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
+                && _calWizardState.step >= 1 && _calWizardState.step <= 5) {
                 _calWizardRefreshLive();
             }
         }, 200);
